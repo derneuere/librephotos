@@ -1,0 +1,112 @@
+name: repro-2868
+
+# Issue #2868: Postgres in a container with Docker's default 64 MB /dev/shm
+# fails parallel queries on a large library. A service container gets exactly
+# that default, so this job runs the admin-page endpoints against it.
+
+on:
+  push:
+    branches: [repro/2868-shm]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: dev
+            repository: LibrePhotos/librephotos
+            ref: dev
+    services:
+      db:
+        image: postgres:18
+        env:
+          POSTGRES_USER: docker
+          POSTGRES_PASSWORD: repro-password
+          POSTGRES_DB: db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docker"
+          --health-interval 5s
+          --health-retries 30
+    env:
+      DJANGO_SETTINGS_MODULE: librephotos.settings.test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: docker
+      DB_PASS: repro-password
+      DB_NAME: db
+      SECRET_KEY: repro
+      BASE_DATA: /tmp/librephotos
+      BASE_LOGS: /tmp/librephotos/logs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repro
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: app
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install backend
+        working-directory: app/apps/backend
+        run: |
+          mkdir -p /tmp/librephotos/logs
+          python -m venv .venv
+          . .venv/bin/activate
+          bash scripts/setup_test_env.sh
+      - name: Postgres container facts
+        run: |
+          docker exec ${{ job.services.db.id }} df -h /dev/shm
+          docker exec ${{ job.services.db.id }} psql -U docker -d db -Atc "select version(); show max_parallel_workers_per_gather; show work_mem; show dynamic_shared_memory_type; show max_worker_processes"
+          nproc
+      - name: Migrate and seed (158k photos)
+        working-directory: app/apps/backend
+        run: |
+          . .venv/bin/activate
+          python manage.py migrate -v0
+          python manage.py shell -c "exec(open('$GITHUB_WORKSPACE/repro/repro/seed.py').read())"
+      - name: Per-endpoint parallel plans
+        working-directory: app/apps/backend
+        run: |
+          . .venv/bin/activate
+          MEASURE_OUT=/tmp/measure.json python manage.py shell -c "exec(open('$GITHUB_WORKSPACE/repro/repro/measure.py').read())"
+      - name: Hammer the admin-page endpoints
+        working-directory: app/apps/backend
+        run: |
+          . .venv/bin/activate
+          ( while true; do docker exec ${{ job.services.db.id }} du -sk /dev/shm 2>/dev/null | cut -f1; sleep 0.2; done ) > /tmp/shm-samples.txt &
+          SAMPLER=$!
+          for threads in 2 4 8; do
+            echo "== $threads threads"
+            HAMMER_THREADS=$threads HAMMER_SECONDS=90 HAMMER_OUT=/tmp/hammer-$threads.json python manage.py shell -c "exec(open('$GITHUB_WORKSPACE/repro/repro/hammer.py').read())" 2>&1 | grep -v "^  " | tail -40
+          done
+          kill $SAMPLER
+          echo "peak /dev/shm KiB: $(sort -n /tmp/shm-samples.txt | tail -1)"
+      - name: Postgres log
+        if: always()
+        run: |
+          docker logs ${{ job.services.db.id }} > /tmp/pg.log 2>&1 || true
+          echo "could not resize shared memory segment: $(grep -c 'could not resize shared memory segment' /tmp/pg.log)"
+          grep -m5 -A2 'could not resize shared memory segment' /tmp/pg.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repro-${{ matrix.label }}
+          path: |
+            /tmp/measure.json
+            /tmp/hammer-*.json
+            /tmp/shm-samples.txt
+            /tmp/pg.log
