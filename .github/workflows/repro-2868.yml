@@ -21,9 +21,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: dev
-            repository: LibrePhotos/librephotos
-            ref: 05666917d3eba04f40f8f35b22394bf029168068
           - label: fix
             repository: derneuere/librephotos
             ref: perf/2868-postgres-dsm
@@ -92,7 +89,7 @@ jobs:
           . .venv/bin/activate
           ( while true; do docker exec ${{ job.services.db.id }} du -sk /dev/shm 2>/dev/null | cut -f1; sleep 0.2; done ) > /tmp/shm-samples.txt &
           SAMPLER=$!
-          for threads in 4 8 12; do
+          for threads in 4 8 12 16; do
             echo "== $threads threads"
             HAMMER_THREADS=$threads HAMMER_SECONDS=90 HAMMER_OUT=/tmp/hammer-$threads.json python manage.py shell -c "exec(open('$GITHUB_WORKSPACE/repro/repro/hammer.py').read())" 2>&1 | grep -v "^  " | tail -40
           done
