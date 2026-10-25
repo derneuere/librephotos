@@ -23,7 +23,7 @@ jobs:
         include:
           - label: dev
             repository: LibrePhotos/librephotos
-            ref: 05666917d
+            ref: 05666917d3eba04f40f8f35b22394bf029168068
           - label: fix
             repository: derneuere/librephotos
             ref: perf/2868-postgres-dsm
