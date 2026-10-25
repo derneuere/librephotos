@@ -72,9 +72,20 @@ for name, call in ENDPOINTS.items():
         continue
     captured = []
 
+    busy = []
+
     def capture(execute, sql, params, many, context):
+        if busy:
+            return execute(sql, params, many, context)
         named = getattr(getattr(context["cursor"], "cursor", None), "name", None)
-        captured.append((sql, params, bool(named)))
+        busy.append(1)
+        try:
+            with context["connection"].cursor() as c:
+                c.execute("SHOW max_parallel_workers_per_gather")
+                workers = c.fetchone()[0]
+        finally:
+            busy.pop()
+        captured.append((sql, params, bool(named), workers))
         return execute(sql, params, many, context)
 
     start = time.perf_counter()
@@ -87,6 +98,7 @@ for name, call in ENDPOINTS.items():
         "status": status,
         "wall_s": round(wall, 2),
         "queries": len(captured),
+        "serial_queries": sum(1 for row in captured if str(row[3]) == "0"),
         "parallel_queries": 0,
         "parallel_hash_queries": 0,
         "parallel_hash_nodes": 0,
@@ -95,12 +107,14 @@ for name, call in ENDPOINTS.items():
         "sum_hash_kb": 0,
         "top": [],
     }
-    for sql, params, named in captured:
+    for sql, params, named, workers in captured:
         if not sql.lstrip().upper().startswith("SELECT") or named:
             continue
         with connection.cursor() as c:
+            c.execute(f"SET max_parallel_workers_per_gather = {int(workers)}")
             c.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, params)
             plan = c.fetchone()[0]
+            c.execute("RESET max_parallel_workers_per_gather")
         if isinstance(plan, str):
             plan = json.loads(plan)
         acc = dict(gathers=0, workers=0, parallel_hash=0, hash_kb=0, hash_batches=1, parallel_bitmap=0)
